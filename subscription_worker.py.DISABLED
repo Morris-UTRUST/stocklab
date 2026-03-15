@@ -1,0 +1,155 @@
+import argparse
+import json
+import re
+import sqlite3
+import subprocess
+import os
+from datetime import datetime
+
+# Ensure app.py uses the project DB (DB_PATH is relative: "stocklab.db")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+os.chdir(BASE_DIR)
+
+from app import (
+    DB_PATH,
+    resolve_stock_name,
+    update_stock,
+    load_price,
+    build_integrated_analysis,
+)
+from report_payloads import generate_report_bundle
+
+TZ = "Asia/Taipei"
+
+
+def markdown_to_plain_text(md: str) -> str:
+    txt = md or ""
+    txt = txt.replace("**", "").replace("__", "").replace("`", "")
+    txt = re.sub(r"^\s{0,3}#{1,6}\s?", "", txt, flags=re.MULTILINE)
+    txt = re.sub(r"^\s*[-*]\s+", "- ", txt, flags=re.MULTILINE)
+    txt = re.sub(r"^\s*---+\s*$", "", txt, flags=re.MULTILINE)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    return txt.strip()
+
+
+def send_report_email(to_emails: str, subject: str, body: str) -> tuple[bool, str]:
+    cmd = [
+        "gog", "gmail", "send",
+        "--account", "morris@utrust.com.tw",
+        "--to", to_emails,
+        "--subject", subject,
+        "--body", body,
+        "--no-input",
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    if p.returncode == 0:
+        return True, "ok"
+    return False, (p.stderr or p.stdout or "send failed").strip()[:500]
+
+
+def is_gmail_auth_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return "no auth for gmail" in m or "oauth" in m and "gog auth add" in m
+
+
+def log_run(conn, sub_id, stock_id, email_to, subject, status, err=""):
+    conn.execute(
+        "INSERT INTO report_runs(subscription_id, run_time, stock_id, email_to, subject, status, error_message) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (sub_id, datetime.now().isoformat(timespec="seconds"), stock_id, email_to, subject, status, err),
+    )
+
+
+def already_ran_today(conn, sub_id, stock_id):
+    d = datetime.now().date().isoformat()
+    cur = conn.execute(
+        "SELECT 1 FROM report_runs WHERE subscription_id=? AND stock_id=? AND substr(run_time,1,10)=? AND status='success' LIMIT 1",
+        (sub_id, stock_id, d),
+    )
+    return cur.fetchone() is not None
+
+
+def is_trading_day(dt: datetime) -> bool:
+    return dt.weekday() < 5
+
+
+def _to_minutes(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def should_run_now(schedule_time: str, now_hhmm: str, grace_minutes: int) -> bool:
+    if schedule_time == now_hhmm:
+        return True
+    if grace_minutes <= 0:
+        return False
+    now_min = _to_minutes(now_hhmm)
+    sch_min = _to_minutes(schedule_time)
+    return sch_min <= now_min <= sch_min + grace_minutes
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--subscription-id", type=int, default=None)
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+
+    now = datetime.now()
+    hhmm = now.strftime("%H:%M")
+    catchup_grace_minutes = int(os.getenv("REPORT_CATCHUP_GRACE_MINUTES", "180"))
+    if (not args.once) and (not is_trading_day(now)):
+        print("skip: non-trading day")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if args.subscription_id:
+            rows = conn.execute(
+                "SELECT id, emails, stock_ids_json, schedule_time, enabled FROM report_subscriptions WHERE enabled=1 AND id=?",
+                (args.subscription_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, emails, stock_ids_json, schedule_time, enabled FROM report_subscriptions WHERE enabled=1"
+            ).fetchall()
+
+        gmail_auth_blocked = False
+        for sub_id, emails, stocks_json, schedule_time, enabled in rows:
+            if not args.once and (not should_run_now(schedule_time, hhmm, catchup_grace_minutes)):
+                continue
+            stock_ids = json.loads(stocks_json)
+            for sid in stock_ids:
+                if gmail_auth_blocked:
+                    log_run(conn, sub_id, sid, emails, f"[智能蝦] {sid}", "failed", "gmail auth missing: skipped remaining jobs in this run")
+                    conn.commit()
+                    print(sub_id, sid, "skipped(no-gmail-auth)")
+                    continue
+                if already_ran_today(conn, sub_id, sid):
+                    continue
+                try:
+                    update_stock(sid, "2024-01-01", None)
+                    df = load_price(sid)
+                    if df.empty:
+                        log_run(conn, sub_id, sid, emails, f"[智能蝦] {sid}", "failed", "no data")
+                        continue
+                    analysis = build_integrated_analysis(df)
+                    name = resolve_stock_name(sid)
+                    _, report = generate_report_bundle(sid, name, analysis)
+                    report_plain = markdown_to_plain_text(report)
+                    subject = f"[智能蝦] {sid} {name} 量化報告 {now.date().isoformat()}"
+                    body = f"股票：{sid} {name}\n\n{report_plain}"
+                    ok, err = send_report_email(emails, subject, body)
+                    log_run(conn, sub_id, sid, emails, subject, "success" if ok else "failed", "" if ok else err)
+                    conn.commit()
+                    if (not ok) and is_gmail_auth_error(err):
+                        gmail_auth_blocked = True
+                    print(sub_id, sid, "ok" if ok else "failed")
+                except Exception as e:
+                    log_run(conn, sub_id, sid, emails, f"[智能蝦] {sid}", "failed", str(e))
+                    conn.commit()
+                    print(sub_id, sid, "error", e)
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

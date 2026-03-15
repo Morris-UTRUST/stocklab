@@ -1,0 +1,263 @@
+"""
+Subscription Worker - 謹慎設計版本
+====================================
+設計原則：
+1. 只在排程的「精確時間」執行（無 grace window）
+2. 每天每個訂閱只執行一次（失敗也視為「已嘗試」）
+3. 失敗時有冷卻時間，避免無限重試
+4. 透過外部 cron 控制執行頻率（本檔案只負責執行）
+"""
+
+import argparse
+import json
+import re
+import sqlite3
+import subprocess
+import os
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Ensure app.py uses the project DB
+BASE_DIR = Path(__file__).parent.resolve()
+os.chdir(BASE_DIR)
+
+from app import (
+    DB_PATH,
+    resolve_stock_name,
+    update_stock,
+    load_price,
+    build_integrated_analysis,
+)
+from report_payloads import generate_report_bundle
+
+TZ = "Asia/Taipei"
+
+# 一天內不再重試的秒數（避免 rate limit 時一直撞）
+RETRY_COOLDOWN_SECONDS = int(os.getenv("RETRY_COOLDOWN_HOURS", "4")) * 3600
+
+
+def markdown_to_plain_text(md: str) -> str:
+    txt = md or ""
+    txt = txt.replace("**", "").replace("__", "").replace("`", "")
+    txt = re.sub(r"^\s{0,3}#{1,6}\s?", "", txt, flags=re.MULTILINE)
+    txt = re.sub(r"^\s*[-*]\s+", "- ", txt, flags=re.MULTILINE)
+    txt = re.sub(r"^\s*---+\s*$", "", txt, flags=re.MULTILINE)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    return txt.strip()
+
+
+def send_report_email(to_emails: str, subject: str, body: str) -> tuple[bool, str]:
+    cmd = [
+        "gog", "gmail", "send",
+        "--account", "morris@utrust.com.tw",
+        "--to", to_emails,
+        "--subject", subject,
+        "--body", body,
+        "--no-input",
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    if p.returncode == 0:
+        return True, "ok"
+    return False, (p.stderr or p.stdout or "send failed").strip()[:500]
+
+
+def is_gmail_auth_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return "no auth for gmail" in m or ("oauth" in m and "gog auth add" in m)
+
+
+def is_rate_limit_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return "rate limit" in m or "429" in m or "api rate limit" in m
+
+
+def log_run(conn, sub_id, stock_id, email_to, subject, status, err=""):
+    """記錄執行結果"""
+    conn.execute(
+        "INSERT INTO report_runs(subscription_id, run_time, stock_id, email_to, subject, status, error_message) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (sub_id, datetime.now().isoformat(timespec="seconds"), stock_id, email_to, subject, status, err),
+    )
+
+
+def already_ran_success_today(conn, sub_id, stock_id) -> bool:
+    """檢查今天是否已經成功寄送"""
+    d = datetime.now().date().isoformat()
+    cur = conn.execute(
+        "SELECT 1 FROM report_runs WHERE subscription_id=? AND stock_id=? AND substr(run_time,1,10)=? AND status='success' LIMIT 1",
+        (sub_id, stock_id, d),
+    )
+    return cur.fetchone() is not None
+
+
+def already_attempted_recently(conn, sub_id, stock_id) -> bool:
+    """檢查短時間內是否已經嘗試過（避免 rate limit 時一直撞）"""
+    cutoff = (datetime.now() - timedelta(seconds=RETRY_COOLDOWN_SECONDS)).isoformat(timespec="seconds")
+    cur = conn.execute(
+        "SELECT 1 FROM report_runs WHERE subscription_id=? AND stock_id=? AND run_time>? AND status='failed' LIMIT 1",
+        (sub_id, stock_id, cutoff),
+    )
+    return cur.fetchone() is not None
+
+
+def is_trading_day(dt: datetime) -> bool:
+    return dt.weekday() < 5
+
+
+def should_run_now(schedule_time: str, now_hhmm: str) -> bool:
+    """
+    嚴格檢查：只有精確時間匹配才執行
+    移除 grace window，避免過度執行
+    """
+    return schedule_time == now_hhmm
+
+
+def main():
+    parser = argparse.ArgumentParser(description="謹慎版訂閱報告 worker")
+    parser.add_argument("--subscription-id", type=int, default=None, help="只處理指定訂閱")
+    parser.add_argument("--once", action="store_true", help="單次執行模式（不限交易日）")
+    parser.add_argument("--dry-run", action="store_true", help="模擬執行，不實際寄送")
+    args = parser.parse_args()
+
+    now = datetime.now()
+    hhmm = now.strftime("%H:%M")
+
+    print(f"[{now.isoformat()}] subscription_worker 啟動 (hhmm={hhmm})")
+
+    # 非單次模式時，檢查是否交易日
+    if not args.once and not is_trading_day(now):
+        print("skip: non-trading day")
+        sys.exit(0)
+
+    # 嚴格時間檢查：只有 HH:MM 完全匹配才執行
+    if not args.once:
+        # 從 DB 讀取所有排程時間
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            sub_rows = conn.execute(
+                "SELECT DISTINCT schedule_time FROM report_subscriptions WHERE enabled=1"
+            ).fetchall()
+            valid_times = [row[0] for row in sub_rows]
+            
+            if hhmm not in valid_times:
+                print(f"skip: {hhmm} not in scheduled times {valid_times}")
+                sys.exit(0)
+        finally:
+            conn.close()
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        # 取得要執行的訂閱
+        if args.subscription_id:
+            rows = conn.execute(
+                "SELECT id, emails, stock_ids_json, schedule_time, enabled FROM report_subscriptions WHERE enabled=1 AND id=?",
+                (args.subscription_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, emails, stock_ids_json, schedule_time, enabled FROM report_subscriptions WHERE enabled=1"
+            ).fetchall()
+
+        print(f"找到 {len(rows)} 個啟用的訂閱")
+
+        gmail_auth_blocked = False
+        rate_limited = False
+        jobs_run = 0
+        jobs_skipped = 0
+        jobs_failed = 0
+
+        for sub_id, emails, stocks_json, schedule_time, enabled in rows:
+            # 嚴格時間檢查
+            if not args.once and not should_run_now(schedule_time, hhmm):
+                continue
+
+            stock_ids = json.loads(stocks_json)
+            print(f"  訂閱 {sub_id}: {stock_ids} (排程 {schedule_time})")
+
+            for sid in stock_ids:
+                # 1. 檢查是否已成功寄送
+                if already_ran_success_today(conn, sub_id, sid):
+                    print(f"    {sid}: 已成功，跳過")
+                    jobs_skipped += 1
+                    continue
+
+                # 2. 檢查是否短時間內已嘗試過（rate limit 保護）
+                if already_attempted_recently(conn, sub_id, sid):
+                    print(f"    {sid}: 短時間內已嘗試且失敗，跳過（冷卻中）")
+                    jobs_skipped += 1
+                    continue
+
+                # 3. Gmail auth 已被封鎖
+                if gmail_auth_blocked:
+                    log_run(conn, sub_id, sid, emails, f"[智能蝦] {sid}", "failed", "gmail auth blocked: skipped")
+                    conn.commit()
+                    print(f"    {sid}: skip (gmail auth blocked)")
+                    jobs_skipped += 1
+                    continue
+
+                # 4. Rate limited
+                if rate_limited:
+                    log_run(conn, sub_id, sid, emails, f"[智能蝦] {sid}", "failed", "rate limited: skipped")
+                    conn.commit()
+                    print(f"    {sid}: skip (rate limited)")
+                    jobs_skipped += 1
+                    continue
+
+                # 5. 執行報告產生
+                try:
+                    print(f"    {sid}: 產生報告中...")
+                    update_stock(sid, "2024-01-01", None)
+                    df = load_price(sid)
+                    if df.empty:
+                        log_run(conn, sub_id, sid, emails, f"[智能蝦] {sid}", "failed", "no data")
+                        conn.commit()
+                        print(f"    {sid}: failed (no data)")
+                        jobs_failed += 1
+                        continue
+
+                    analysis = build_integrated_analysis(df)
+                    name = resolve_stock_name(sid)
+                    _, report = generate_report_bundle(sid, name, analysis)
+
+                    report_plain = markdown_to_plain_text(report)
+                    subject = f"[智能蝦] {sid} {name} 量化報告 {now.date().isoformat()}"
+
+                    if args.dry_run:
+                        print(f"    {sid}: [DRY-RUN] would send to {emails}")
+                        log_run(conn, sub_id, sid, emails, subject, "success (dry-run)", "")
+                        conn.commit()
+                        jobs_run += 1
+                    else:
+                        ok, err = send_report_email(emails, subject, report_plain)
+                        log_run(conn, sub_id, sid, emails, subject, "success" if ok else "failed", "" if ok else err)
+                        conn.commit()
+
+                        if ok:
+                            print(f"    {sid}: success")
+                            jobs_run += 1
+                        else:
+                            print(f"    {sid}: failed ({err[:50]}...)")
+                            jobs_failed += 1
+                            
+                            # 檢測錯誤類型
+                            if is_gmail_auth_error(err):
+                                gmail_auth_blocked = True
+                                print(f"    !! Gmail auth error detected, will skip remaining")
+                            elif is_rate_limit_error(err):
+                                rate_limited = True
+                                print(f"    !! API rate limit detected, will skip remaining")
+
+                except Exception as e:
+                    log_run(conn, sub_id, sid, emails, f"[智能蝦] {sid}", "failed", str(e))
+                    conn.commit()
+                    print(f"    {sid}: error - {e}")
+                    jobs_failed += 1
+
+        print(f"完成: run={jobs_run}, skipped={jobs_skipped}, failed={jobs_failed}")
+
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
