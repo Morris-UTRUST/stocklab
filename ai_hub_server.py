@@ -17,6 +17,12 @@ OLLAMA_MODEL = os.getenv("AI_HUB_MODEL", "qwen3:8b")
 OLLAMA_TIMEOUT = int(os.getenv("AI_HUB_TIMEOUT_SECONDS", "120"))
 OLLAMA_RETRIES = int(os.getenv("AI_HUB_RETRIES", "2"))
 OPENCLAW_REPORT_PROVIDER = os.getenv("AI_HUB_REPORT_PROVIDER", "openclaw")
+
+# Cloud API 設定
+CLOUD_API_BASE = os.getenv("AI_HUB_CLOUD_API_BASE", "https://openrouter.ai/api/v1")
+CLOUD_API_KEY = os.getenv("AI_HUB_CLOUD_API_KEY", "")
+CLOUD_REPORT_MODEL = os.getenv("AI_HUB_CLOUD_MODEL", "openai-codex/gpt-5.4")
+CLOUD_TIMEOUT = int(os.getenv("AI_HUB_CLOUD_TIMEOUT_SEC", "90"))
 OPENCLAW_CLI = os.getenv("AI_HUB_OPENCLAW_CLI", "/opt/homebrew/bin/openclaw")
 OPENCLAW_AGENT_ID = os.getenv("AI_HUB_OPENCLAW_AGENT_ID", "sub1")
 OPENCLAW_FALLBACK_AGENT_ID = os.getenv("AI_HUB_OPENCLAW_FALLBACK_AGENT_ID", "main")
@@ -167,6 +173,33 @@ def _extract_openclaw_text(raw: str) -> str:
     return s
 
 
+
+
+def _cloud_report_text(prompt: str) -> str:
+    """直接呼叫雲端 API (OpenRouter)"""
+    if not CLOUD_API_KEY:
+        raise RuntimeError("cloud_api_key_missing")
+
+    r = requests.post(
+        f"{CLOUD_API_BASE}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {CLOUD_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost",
+            "X-Title": "StockLab-AI-Hub"
+        },
+        json={
+            "model": CLOUD_REPORT_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+        },
+        timeout=CLOUD_TIMEOUT,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+
+
 def _openclaw_report_text(payload: dict, prompt: str) -> str:
     message = (
         "以下為量化分析結構化資料(JSON)。請直接輸出最終投資報告內容，不要輸出 JSON。\n"
@@ -284,12 +317,37 @@ class Handler(BaseHTTPRequestHandler):
                 route = "ollama_local"
                 model = OLLAMA_MODEL
 
-                if OPENCLAW_REPORT_PROVIDER == "openclaw":
-                    report = _openclaw_report_text(payload, prompt)
-                    route = "openclaw_sub1_main"
-                    model = f"{OPENCLAW_AGENT_ID}->{OPENCLAW_FALLBACK_AGENT_ID}"
+                # 路由順序: Cloud API > OpenClaw > Ollama
+                if CLOUD_API_KEY:
+                    try:
+                        report = _cloud_report_text(prompt)
+                        route = "cloud"
+                        model = CLOUD_REPORT_MODEL
+                    except Exception as cloud_err:
+                        print(f"[WARN] Cloud failed: {cloud_err}, trying OpenClaw...")
+                        try:
+                            report = _openclaw_report_text(payload, prompt)
+                            route = "openclaw_sub1_main"
+                            model = f"{OPENCLAW_AGENT_ID}->{OPENCLAW_FALLBACK_AGENT_ID}"
+                        except Exception as oc_err:
+                            print(f"[WARN] OpenClaw failed: {oc_err}, falling back to Ollama...")
+                            report = self._ollama_text(prompt, temperature=0.2)
+                            route = "ollama_local"
+                            model = OLLAMA_MODEL
+                elif OPENCLAW_REPORT_PROVIDER == "openclaw":
+                    try:
+                        report = _openclaw_report_text(payload, prompt)
+                        route = "openclaw_sub1_main"
+                        model = f"{OPENCLAW_AGENT_ID}->{OPENCLAW_FALLBACK_AGENT_ID}"
+                    except Exception as oc_err:
+                        print(f"[WARN] OpenClaw failed: {oc_err}, falling back to Ollama...")
+                        report = self._ollama_text(prompt, temperature=0.2)
+                        route = "ollama_local"
+                        model = OLLAMA_MODEL
                 else:
                     report = self._ollama_text(prompt, temperature=0.2)
+                    route = "ollama_local"
+                    model = OLLAMA_MODEL
 
                 if not report:
                     report = "### AI 報告產生失敗\n模型未回傳內容。"
